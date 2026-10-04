@@ -21,7 +21,9 @@
     Password que se configurara para acceso desatendido.
 
 .EXAMPLE
-    .\Install-AnyDesk.ps1 -UnattendedPassword 'PASSWORD'
+    .\Install-AnyDesk.ps1
+    Solicita interactivamente la password de acceso desatendido.
+
 #>
 
 [CmdletBinding()]
