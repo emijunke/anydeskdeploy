@@ -5,15 +5,16 @@
     Desinstalacion automatizada de AnyDesk.
 
 .DESCRIPTION
-    - Requiere PowerShell como Administrador.
-    - Detecta AnyDesk instalado.
+    - Requiere PowerShell ejecutado como Administrador.
+    - Distingue entre AnyDesk instalado y AnyDesk portable.
+    - Detecta el servicio AnyDesk.
+    - Localiza la instalacion persistente.
     - Obtiene ID y version antes de desinstalar.
-    - Detecta servicio y procesos.
-    - Advierte que una sesion AnyDesk activa sera desconectada.
-    - Ejecuta la desinstalacion silenciosa.
-    - Verifica el resultado.
+    - Desinstala la instalacion persistente.
+    - Verifica que el servicio haya desaparecido.
+    - NO elimina un AnyDesk portable externo por defecto.
+    - Opcionalmente elimina configuracion residual con -RemoveData.
     - Genera log en C:\ProgramData\AnyDeskDeploy.
-    - Opcionalmente elimina datos residuales con -RemoveData.
 
 .EXAMPLE
     .\Uninstall-AnyDesk.ps1
@@ -33,17 +34,21 @@ param (
 
 $ErrorActionPreference = "Stop"
 
+
 # ============================================================
 # CONFIGURACION
 # ============================================================
 
-$LogDir  = "C:\ProgramData\AnyDeskDeploy"
-$LogFile = Join-Path $LogDir "AnyDesk_Uninstall.log"
+$LogDir = "C:\ProgramData\AnyDeskDeploy"
 
-New-Item `
-    -ItemType Directory `
-    -Path $LogDir `
-    -Force | Out-Null
+$LogFile = Join-Path `
+    $LogDir `
+    "AnyDesk_Uninstall.log"
+
+
+$Script:InstalledExe = $null
+$Script:PortableExe  = $null
+$Script:AnyDeskID    = $null
 
 
 # ============================================================
@@ -53,34 +58,51 @@ New-Item `
 function Write-Log {
 
     param (
+
         [Parameter(Mandatory = $true)]
         [string]$Message,
 
-        [ValidateSet("INFO","OK","WARN","ERROR")]
+        [ValidateSet("INFO", "OK", "WARN", "ERROR")]
         [string]$Level = "INFO"
     )
 
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $Line = "[$Timestamp] [$Level] $Message"
+
+    $Line = "[{0}] [{1}] {2}" -f `
+        $Timestamp,
+        $Level,
+        $Message
+
 
     switch ($Level) {
 
         "OK" {
-            Write-Host $Line -ForegroundColor Green
+
+            Write-Host `
+                $Line `
+                -ForegroundColor Green
         }
 
         "WARN" {
-            Write-Host $Line -ForegroundColor Yellow
+
+            Write-Host `
+                $Line `
+                -ForegroundColor Yellow
         }
 
         "ERROR" {
-            Write-Host $Line -ForegroundColor Red
+
+            Write-Host `
+                $Line `
+                -ForegroundColor Red
         }
 
         default {
+
             Write-Host $Line
         }
     }
+
 
     Add-Content `
         -Path $LogFile `
@@ -89,13 +111,16 @@ function Write-Log {
 }
 
 
+
 function Test-Administrator {
 
     $Identity = `
         [Security.Principal.WindowsIdentity]::GetCurrent()
 
+
     $Principal = New-Object `
         Security.Principal.WindowsPrincipal($Identity)
+
 
     return $Principal.IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator
@@ -103,9 +128,20 @@ function Test-Administrator {
 }
 
 
-function Find-AnyDeskExecutable {
+
+function Get-AnyDeskService {
+
+    return Get-Service `
+        -Name "AnyDesk" `
+        -ErrorAction SilentlyContinue
+}
+
+
+
+function Find-InstalledAnyDesk {
 
     $Paths = @()
+
 
     if (${env:ProgramFiles(x86)}) {
 
@@ -114,6 +150,7 @@ function Find-AnyDeskExecutable {
             "AnyDesk\AnyDesk.exe"
     }
 
+
     if ($env:ProgramFiles) {
 
         $Paths += Join-Path `
@@ -121,21 +158,65 @@ function Find-AnyDeskExecutable {
             "AnyDesk\AnyDesk.exe"
     }
 
-    if ($env:LOCALAPPDATA) {
-
-        $Paths += Join-Path `
-            $env:LOCALAPPDATA `
-            "AnyDesk\AnyDesk.exe"
-    }
-
 
     foreach ($Path in $Paths) {
 
         if (Test-Path $Path) {
+
             return $Path
         }
     }
 
+
+    # Si no esta en las rutas estandar, intentar obtener
+    # el ejecutable desde el servicio.
+
+    try {
+
+        $ServiceCIM = Get-CimInstance `
+            Win32_Service `
+            -Filter "Name='AnyDesk'" `
+            -ErrorAction SilentlyContinue
+
+
+        if ($ServiceCIM -and $ServiceCIM.PathName) {
+
+            $ServicePath = $ServiceCIM.PathName.Trim()
+
+
+            if ($ServicePath.StartsWith('"')) {
+
+                $ServicePath = `
+                    ($ServicePath -split '"')[1]
+
+            }
+            else {
+
+                $ServicePath = `
+                    ($ServicePath -split '\s+')[0]
+            }
+
+
+            if (
+                $ServicePath -and
+                (Test-Path $ServicePath)
+            ) {
+
+                return $ServicePath
+            }
+        }
+
+    }
+    catch {
+    }
+
+
+    return $null
+}
+
+
+
+function Find-PortableAnyDesk {
 
     $Processes = Get-Process `
         -Name "AnyDesk" `
@@ -151,7 +232,40 @@ function Find-AnyDeskExecutable {
                 (Test-Path $Process.Path)
             ) {
 
-                return $Process.Path
+                $Path = $Process.Path
+
+
+                $IsInstalledPath = $false
+
+
+                if ($env:ProgramFiles) {
+
+                    if (
+                        $Path -like `
+                        "$env:ProgramFiles\AnyDesk\*"
+                    ) {
+
+                        $IsInstalledPath = $true
+                    }
+                }
+
+
+                if (${env:ProgramFiles(x86)}) {
+
+                    if (
+                        $Path -like `
+                        "${env:ProgramFiles(x86)}\AnyDesk\*"
+                    ) {
+
+                        $IsInstalledPath = $true
+                    }
+                }
+
+
+                if (-not $IsInstalledPath) {
+
+                    return $Path
+                }
             }
 
         }
@@ -164,42 +278,59 @@ function Find-AnyDeskExecutable {
 }
 
 
+
 function Get-AnyDeskID {
 
     param (
+
+        [Parameter(Mandatory = $true)]
         [string]$Executable
     )
 
+
     try {
 
-        return (
+        $Result = (
             & $Executable --get-id 2>$null |
             Out-String
         ).Trim()
 
+
+        if ($Result) {
+
+            return $Result
+        }
+
     }
     catch {
-
-        return $null
     }
+
+
+    return $null
 }
+
 
 
 function Get-AnyDeskVersion {
 
     param (
+
+        [Parameter(Mandatory = $true)]
         [string]$Executable
     )
 
+
     try {
 
-        $Version = (
+        $Result = (
             & $Executable --version 2>$null |
             Out-String
         ).Trim()
 
-        if ($Version) {
-            return $Version
+
+        if ($Result) {
+
+            return $Result
         }
 
     }
@@ -215,15 +346,24 @@ function Get-AnyDeskVersion {
 
     }
     catch {
-
-        return "No disponible"
     }
+
+
+    return "No disponible"
 }
 
 
+
 # ============================================================
-# INICIO
+# PREPARACION
 # ============================================================
+
+New-Item `
+    -ItemType Directory `
+    -Path $LogDir `
+    -Force |
+    Out-Null
+
 
 Write-Host ""
 Write-Host "============================================================"
@@ -231,9 +371,18 @@ Write-Host " ANYDESK - DESINSTALACION AUTOMATICA"
 Write-Host "============================================================"
 Write-Host ""
 
-Write-Log "Inicio de desinstalacion."
-Write-Log "Equipo: $env:COMPUTERNAME"
-Write-Log "Usuario: $env:USERDOMAIN\$env:USERNAME"
+
+Write-Log `
+    "Inicio de desinstalacion."
+
+
+Write-Log `
+    "Equipo: $env:COMPUTERNAME"
+
+
+Write-Log `
+    "Usuario: $env:USERDOMAIN\$env:USERNAME"
+
 
 
 # ============================================================
@@ -246,86 +395,181 @@ if (-not (Test-Administrator)) {
         "PowerShell debe ejecutarse como Administrador." `
         "ERROR"
 
+
     exit 10
 }
+
 
 Write-Log `
     "Privilegios de administrador confirmados." `
     "OK"
 
 
+
 # ============================================================
-# LOCALIZAR ANYDESK
+# RELEVAMIENTO
 # ============================================================
 
-Write-Log "Buscando AnyDesk..."
+Write-Log `
+    "Relevando instalacion de AnyDesk..."
 
-$AnyDeskExe = Find-AnyDeskExecutable
+
+$Service = Get-AnyDeskService
+
+$Script:InstalledExe = Find-InstalledAnyDesk
+
+$Script:PortableExe = Find-PortableAnyDesk
 
 
-if (-not $AnyDeskExe) {
+
+# ============================================================
+# MOSTRAR PORTABLE
+# ============================================================
+
+if ($Script:PortableExe) {
 
     Write-Log `
-        "No se encontro una instalacion de AnyDesk." `
+        "AnyDesk PORTABLE detectado." `
         "WARN"
+
+
+    Write-Log `
+        "Portable: $Script:PortableExe"
+
+
+    Write-Log `
+        "El archivo portable NO sera eliminado." `
+        "INFO"
+}
+
+
+
+# ============================================================
+# VALIDAR INSTALACION PERSISTENTE
+# ============================================================
+
+if (-not $Service) {
+
+    Write-Log `
+        "No se encontro el servicio AnyDesk." `
+        "WARN"
+
+
+    if ($Script:PortableExe) {
+
+        Write-Host ""
+        Write-Host "Solo se detecto una instancia PORTABLE."
+        Write-Host ""
+        Write-Host "Portable:"
+        Write-Host $Script:PortableExe
+        Write-Host ""
+        Write-Host "No existe una instalacion persistente para desinstalar."
+        Write-Host ""
+        Write-Host "El portable NO sera cerrado ni eliminado."
+        Write-Host ""
+
+
+        Write-Log `
+            "No existe instalacion persistente. No se realizan cambios." `
+            "OK"
+
+
+        exit 0
+    }
+
 
     Write-Host ""
     Write-Host "AnyDesk no parece estar instalado."
     Write-Host ""
 
+
+    Write-Log `
+        "AnyDesk no esta instalado." `
+        "OK"
+
+
     exit 0
 }
 
 
+
 Write-Log `
-    "AnyDesk encontrado: $AnyDeskExe" `
+    "Servicio AnyDesk detectado." `
     "OK"
+
+
+Write-Log `
+    "Estado del servicio: $($Service.Status)"
+
+
+
+# ============================================================
+# VALIDAR EJECUTABLE INSTALADO
+# ============================================================
+
+if (-not $Script:InstalledExe) {
+
+    Write-Log `
+        "Existe el servicio pero no se pudo localizar AnyDesk.exe." `
+        "ERROR"
+
+
+    exit 11
+}
+
+
+
+Write-Log `
+    "Instalacion persistente: $Script:InstalledExe" `
+    "OK"
+
 
 
 # ============================================================
 # INFORMACION PREVIA
 # ============================================================
 
-$AnyDeskID = Get-AnyDeskID `
-    -Executable $AnyDeskExe
-
 $Version = Get-AnyDeskVersion `
-    -Executable $AnyDeskExe
+    -Executable $Script:InstalledExe
 
 
-if ($AnyDeskID) {
-    Write-Log "AnyDesk ID: $AnyDeskID"
+$Script:AnyDeskID = Get-AnyDeskID `
+    -Executable $Script:InstalledExe
+
+
+Write-Log `
+    "Version instalada: $Version"
+
+
+if ($Script:AnyDeskID) {
+
+    Write-Log `
+        "AnyDesk ID: $Script:AnyDeskID" `
+        "OK"
 }
 
-Write-Log "Version: $Version"
 
 
 # ============================================================
-# SERVICIO Y PROCESOS
+# INFORMACION DEL SERVICIO
 # ============================================================
 
-$Service = Get-Service `
-    -Name "AnyDesk" `
-    -ErrorAction SilentlyContinue
-
-$Processes = Get-Process `
-    -Name "AnyDesk" `
+$ServiceCIM = Get-CimInstance `
+    Win32_Service `
+    -Filter "Name='AnyDesk'" `
     -ErrorAction SilentlyContinue
 
 
-if ($Service) {
+if ($ServiceCIM) {
 
     Write-Log `
-        "Servicio AnyDesk: $($Service.Status)"
-}
+        "StartupType: $($ServiceCIM.StartMode)"
 
-
-if ($Processes) {
 
     Write-Log `
-        "Se detectaron procesos AnyDesk activos." `
-        "WARN"
+        "Servicio ejecutable: $($ServiceCIM.PathName)"
 }
+
 
 
 # ============================================================
@@ -343,17 +587,63 @@ Write-Host "============================================================" `
     -ForegroundColor Yellow
 
 Write-Host ""
-Write-Host "La desinstalacion detendra AnyDesk."
-Write-Host ""
-Write-Host "Si esta conectado a este equipo mediante AnyDesk,"
-Write-Host "LA SESION REMOTA SE DESCONECTARA."
+
+Write-Host `
+    "Se va a desinstalar la instalacion persistente de AnyDesk."
+
 Write-Host ""
 
-if ($AnyDeskID) {
-    Write-Host "AnyDesk ID actual: $AnyDeskID"
+Write-Host `
+    "Ejecutable instalado: $Script:InstalledExe"
+
+Write-Host `
+    "Version: $Version"
+
+
+if ($Script:AnyDeskID) {
+
+    Write-Host `
+        "AnyDesk ID: $Script:AnyDeskID"
 }
 
+
 Write-Host ""
+
+
+if ($Script:PortableExe) {
+
+    Write-Host `
+        "Tambien existe una instancia portable:"
+
+    Write-Host `
+        $Script:PortableExe
+
+    Write-Host ""
+
+    Write-Host `
+        "El portable NO sera eliminado."
+
+    Write-Host ""
+}
+
+
+Write-Host `
+    "La desinstalacion detendra el servicio AnyDesk." `
+    -ForegroundColor Yellow
+
+
+Write-Host ""
+
+Write-Host `
+    "Si la conexion actual depende de ese servicio," `
+    -ForegroundColor Yellow
+
+Write-Host `
+    "LA SESION REMOTA PUEDE DESCONECTARSE." `
+    -ForegroundColor Yellow
+
+Write-Host ""
+
 
 
 # ============================================================
@@ -365,18 +655,22 @@ if (-not $Force) {
     $Confirmation = Read-Host `
         "Escriba DESINSTALAR para continuar"
 
+
     if ($Confirmation -cne "DESINSTALAR") {
 
         Write-Log `
             "Desinstalacion cancelada por el usuario." `
             "WARN"
 
+
         Write-Host ""
         Write-Host "Operacion cancelada."
         Write-Host ""
 
+
         exit 0
     }
+
 }
 else {
 
@@ -386,30 +680,36 @@ else {
 }
 
 
+
 # ============================================================
-# DESINSTALACION
+# DESINSTALAR
 # ============================================================
 
-Write-Log "Iniciando desinstalacion de AnyDesk..."
+Write-Log `
+    "Iniciando desinstalacion de AnyDesk..."
 
 
 try {
 
     $Arguments = @(
-        "--remove"
+        "--remove",
         "--silent"
     )
 
 
-    $Process = Start-Process `
-        -FilePath $AnyDeskExe `
+    $UninstallProcess = Start-Process `
+        -FilePath $Script:InstalledExe `
         -ArgumentList $Arguments `
         -PassThru
 
 
+    Write-Log `
+        "Proceso de desinstalacion iniciado. PID: $($UninstallProcess.Id)"
+
+
     try {
 
-        $Process |
+        $UninstallProcess |
             Wait-Process `
                 -Timeout 60 `
                 -ErrorAction Stop
@@ -418,7 +718,7 @@ try {
     catch {
 
         Write-Log `
-            "El proceso de desinstalacion continua o finalizo cerrando AnyDesk." `
+            "El proceso de desinstalacion continua o excedio el tiempo de espera." `
             "WARN"
     }
 
@@ -429,70 +729,96 @@ catch {
         "Error iniciando desinstalacion: $($_.Exception.Message)" `
         "ERROR"
 
+
     exit 20
 }
 
 
+
 # ============================================================
-# ESPERAR
+# ESPERAR DESAPARICION DEL SERVICIO
 # ============================================================
 
-Write-Log "Esperando finalizacion..."
+Write-Log `
+    "Esperando eliminacion del servicio AnyDesk..."
 
-Start-Sleep -Seconds 10
+
+$Timeout = 90
+
+$Elapsed = 0
+
+
+do {
+
+    Start-Sleep -Seconds 2
+
+    $Elapsed += 2
+
+    $ServiceAfter = Get-AnyDeskService
+
+}
+while (
+    $ServiceAfter -and
+    $Elapsed -lt $Timeout
+)
+
 
 
 # ============================================================
 # VERIFICACION
 # ============================================================
 
-$ServiceAfter = Get-Service `
-    -Name "AnyDesk" `
-    -ErrorAction SilentlyContinue
+$ServiceAfter = Get-AnyDeskService
 
-$ExeAfter = Find-AnyDeskExecutable
+$InstalledExeAfter = Find-InstalledAnyDesk
 
 
-if (
-    -not $ServiceAfter -and
-    -not $ExeAfter
-) {
+
+if (-not $ServiceAfter) {
 
     Write-Log `
-        "AnyDesk fue desinstalado correctamente." `
+        "Servicio AnyDesk eliminado." `
         "OK"
 
 }
 else {
 
     Write-Log `
-        "Todavia se detectan componentes de AnyDesk." `
-        "WARN"
-
-    if ($ServiceAfter) {
-
-        Write-Log `
-            "Servicio detectado: $($ServiceAfter.Status)" `
-            "WARN"
-    }
-
-    if ($ExeAfter) {
-
-        Write-Log `
-            "Ejecutable detectado: $ExeAfter" `
-            "WARN"
-    }
+        "El servicio AnyDesk todavia existe." `
+        "ERROR"
 }
 
 
+
+if ($InstalledExeAfter) {
+
+    Write-Log `
+        "Todavia existe ejecutable instalado: $InstalledExeAfter" `
+        "WARN"
+
+}
+else {
+
+    Write-Log `
+        "Ejecutable de instalacion persistente eliminado." `
+        "OK"
+}
+
+
+
 # ============================================================
-# ELIMINAR DATOS - OPCIONAL
+# REMOVE DATA OPCIONAL
 # ============================================================
 
 if ($RemoveData) {
 
     Write-Log `
-        "RemoveData habilitado. Eliminando datos residuales..." `
+        "RemoveData habilitado." `
+        "WARN"
+
+
+    Write-Log `
+        "Se eliminaran configuraciones residuales de AnyDesk." `
         "WARN"
 
 
@@ -515,6 +841,7 @@ if ($RemoveData) {
                     -Force `
                     -ErrorAction Stop
 
+
                 Write-Log `
                     "Eliminado: $Path" `
                     "OK"
@@ -533,55 +860,180 @@ if ($RemoveData) {
 else {
 
     Write-Log `
-        "Se conservaron los datos/configuracion de AnyDesk."
+        "Configuracion residual conservada."
+
 
     Write-Log `
-        "Use -RemoveData si desea eliminar tambien la configuracion." `
-        "INFO"
+        "Use -RemoveData para eliminar tambien configuraciones."
 }
+
+
+
+# ============================================================
+# COMPROBAR PORTABLE DESPUES
+# ============================================================
+
+$PortableAfter = Find-PortableAnyDesk
+
+
+if ($PortableAfter) {
+
+    Write-Log `
+        "La instancia portable continua presente: $PortableAfter" `
+        "OK"
+}
+
 
 
 # ============================================================
 # RESULTADO
 # ============================================================
 
-Write-Host ""
-Write-Host "============================================================"
-Write-Host " RESULTADO"
-Write-Host "============================================================"
-Write-Host ""
+$UninstallOK = $true
 
-Write-Host "Equipo       : $env:COMPUTERNAME"
-Write-Host "Version      : $Version"
 
-if ($AnyDeskID) {
-    Write-Host "AnyDesk ID   : $AnyDeskID"
+if ($ServiceAfter) {
+
+    $UninstallOK = $false
 }
 
-if (-not $ServiceAfter -and -not $ExeAfter) {
 
-    Write-Host "Estado       : DESINSTALADO" `
+
+Write-Host ""
+Write-Host "============================================================"
+Write-Host " RESULTADO DESINSTALACION ANYDESK"
+Write-Host "============================================================"
+Write-Host ""
+
+
+Write-Host `
+    ("Equipo              : {0}" -f $env:COMPUTERNAME)
+
+
+Write-Host `
+    ("Version anterior    : {0}" -f $Version)
+
+
+if ($Script:AnyDeskID) {
+
+    Write-Host `
+        ("AnyDesk ID anterior: {0}" -f $Script:AnyDeskID)
+}
+
+
+if ($ServiceAfter) {
+
+    Write-Host `
+        "Servicio           : TODAVIA EXISTE"
+
+}
+else {
+
+    Write-Host `
+        "Servicio           : ELIMINADO"
+}
+
+
+if ($InstalledExeAfter) {
+
+    Write-Host `
+        ("Ejecutable        : {0}" -f $InstalledExeAfter)
+
+}
+else {
+
+    Write-Host `
+        "Ejecutable        : ELIMINADO"
+}
+
+
+if ($PortableAfter) {
+
+    Write-Host `
+        ("Portable          : {0}" -f $PortableAfter)
+
+}
+else {
+
+    Write-Host `
+        "Portable          : No detectado"
+}
+
+
+Write-Host `
+    ("RemoveData          : {0}" -f $RemoveData)
+
+
+Write-Host `
+    ("Log                 : {0}" -f $LogFile)
+
+
+Write-Host ""
+Write-Host "============================================================"
+
+
+
+# ============================================================
+# FINAL
+# ============================================================
+
+if ($UninstallOK) {
+
+    Write-Host ""
+    Write-Host `
+        "ANYDESK DESINSTALADO CORRECTAMENTE" `
         -ForegroundColor Green
 
+
+    if ($PortableAfter) {
+
+        Write-Host ""
+        Write-Host `
+            "La instancia portable NO fue eliminada." `
+            -ForegroundColor Yellow
+    }
+
+
+    Write-Host ""
+
+
+    Write-Log `
+        "Desinstalacion finalizada correctamente." `
+        "OK"
+
 }
 else {
 
-    Write-Host "Estado       : REVISAR" `
-        -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host `
+        "DESINSTALACION FINALIZADA CON ERRORES" `
+        -ForegroundColor Red
+
+
+    Write-Host `
+        "Revise: $LogFile"
+
+
+    Write-Host ""
+
+
+    Write-Log `
+        "Desinstalacion finalizada con errores." `
+        "ERROR"
 }
 
-Write-Host "RemoveData   : $RemoveData"
-Write-Host "Log          : $LogFile"
-
-Write-Host ""
-Write-Host "============================================================"
-
-Write-Log "Fin del procedimiento."
 
 
-if (-not $ServiceAfter -and -not $ExeAfter) {
+Write-Log `
+    "Fin del script."
+
+
+if ($UninstallOK) {
+
     exit 0
+
 }
 else {
+
     exit 1
 }
