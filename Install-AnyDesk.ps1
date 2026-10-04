@@ -26,10 +26,36 @@
 
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
+    [Parameter(Mandatory = $false)]
     [string]$UnattendedPassword
 )
+
+# Si no se proporciono password como parametro, solicitarlo
+# de forma interactiva y sin mostrarlo en pantalla.
+if ([string]::IsNullOrWhiteSpace($UnattendedPassword)) {
+
+    Write-Host ""
+    Write-Host "============================================================"
+    Write-Host " CONFIGURACION DE ACCESO DESATENDIDO"
+    Write-Host "============================================================"
+    Write-Host ""
+
+    $SecurePassword = Read-Host `
+        "Ingrese la password de acceso desatendido de AnyDesk" `
+        -AsSecureString
+
+    $BSTR = [Runtime.InteropServices.Marshal]::SecureStringToBSTR(
+        $SecurePassword
+    )
+
+    try {
+        $UnattendedPassword = `
+            [Runtime.InteropServices.Marshal]::PtrToStringBSTR($BSTR)
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
+    }
+}
 
 $ErrorActionPreference = "Stop"
 
