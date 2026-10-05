@@ -11,7 +11,9 @@
         * descarga AnyDesk;
         * realiza instalacion persistente;
         * verifica la creacion del servicio.
-    - NO detiene ni reinicia un servicio AnyDesk que ya estuviera en ejecucion.
+    - Si el servicio ya existe, reemplaza esa instalacion.
+    - Si no esta el instalador, lo descarga.
+    - NO detiene una instancia portable.
     - Configura el servicio como Automatic.
     - Configura acceso desatendido.
     - Oculta la aplicacion al usuario local:
@@ -316,9 +318,56 @@ function Get-AnyDeskServicePid {
 
 
 
+function Get-AnyDeskServiceExecutable {
+
+    $Service = Get-CimInstance `
+        -ClassName Win32_Service `
+        -Filter "Name='AnyDesk'" `
+        -ErrorAction SilentlyContinue
+
+
+    if (-not $Service -or -not $Service.PathName) {
+
+        return $null
+    }
+
+
+    $PathName = [string]$Service.PathName
+
+    $Executable = $null
+
+
+    if ($PathName -match '^"([^"]+\.exe)"') {
+
+        $Executable = $Matches[1]
+
+    }
+    elseif ($PathName -match '^(\S+\.exe)') {
+
+        $Executable = $Matches[1]
+    }
+
+
+    if (
+        $Executable -and
+        (Test-Path -LiteralPath $Executable) -and
+        ($Executable -notlike "$TempDir\*")
+    ) {
+
+        return $Executable
+    }
+
+
+    return $null
+}
+
+
+
 function Find-InstalledAnyDesk {
 
-    $Paths = @()
+    $Paths = @(
+        (Join-Path $InstallDir "AnyDesk.exe")
+    )
 
 
     if (${env:ProgramFiles(x86)}) {
@@ -337,9 +386,17 @@ function Find-InstalledAnyDesk {
     }
 
 
+    $FromService = Get-AnyDeskServiceExecutable
+
+    if ($FromService) {
+
+        $Paths += $FromService
+    }
+
+
     foreach ($Path in $Paths) {
 
-        if (Test-Path -LiteralPath $Path) {
+        if ($Path -and (Test-Path -LiteralPath $Path)) {
 
             return $Path
         }
@@ -347,6 +404,288 @@ function Find-InstalledAnyDesk {
 
 
     return $null
+}
+
+
+
+function Wait-InstalledAnyDeskFile {
+
+    param (
+        [int]$TimeoutSeconds = 60
+    )
+
+
+    $Elapsed = 0
+
+
+    while ($Elapsed -lt $TimeoutSeconds) {
+
+        $Found = Find-InstalledAnyDesk
+
+        if ($Found) {
+
+            return $Found
+        }
+
+
+        Start-Sleep -Seconds 2
+
+        $Elapsed += 2
+    }
+
+
+    return Find-InstalledAnyDesk
+}
+
+
+
+function Remove-AnyDeskServiceRecord {
+
+    $ServicePid = Get-AnyDeskServicePid
+
+    $Service = Get-AnyDeskService
+
+
+    if ($Service -and $Service.Status -ne "Stopped") {
+
+        try {
+
+            Stop-Service `
+                -Name "AnyDesk" `
+                -Force `
+                -ErrorAction Stop
+
+
+            $Service.WaitForStatus(
+                [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+                [TimeSpan]::FromSeconds(20)
+            )
+
+        }
+        catch {
+
+            Write-Log `
+                "No se pudo detener el servicio antes de reemplazarlo: $($_.Exception.Message)" `
+                "WARN"
+        }
+    }
+
+
+    if (
+        $ServicePid -and
+        $ServicePid -ne 0
+    ) {
+
+        Stop-Process `
+            -Id $ServicePid `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+
+
+    & "$env:SystemRoot\System32\sc.exe" delete AnyDesk |
+        Out-Null
+
+
+    $Elapsed = 0
+
+
+    while ($Elapsed -lt 20) {
+
+        if (-not (Get-AnyDeskService)) {
+
+            Write-Log `
+                "Servicio anterior eliminado. Se instalara de nuevo." `
+                "OK"
+
+            return
+        }
+
+
+        Start-Sleep -Seconds 1
+
+        $Elapsed++
+    }
+
+
+    Write-Log `
+        "El servicio anterior sigue registrado. El instalador intentara reemplazarlo." `
+        "WARN"
+}
+
+
+
+function Receive-AnyDeskInstaller {
+
+    $NeedsDownload = $true
+
+
+    if (Test-Path -LiteralPath $Installer) {
+
+        $Existing = Get-Item -LiteralPath $Installer
+
+        if ($Existing.Length -ge 1MB) {
+
+            $ExistingSignature = Get-AuthenticodeSignature $Installer
+
+            if ($ExistingSignature.Status -eq "Valid") {
+
+                $NeedsDownload = $false
+
+                Write-Log `
+                    ("Instalador ya presente. Tamano: {0:N2} MB" -f ($Existing.Length / 1MB)) `
+                    "OK"
+            }
+        }
+    }
+
+
+    if ($NeedsDownload) {
+
+        Write-Log `
+            "No se encontro un instalador valido. Se descargara AnyDesk."
+
+
+        try {
+
+            [Net.ServicePointManager]::SecurityProtocol = `
+                [Net.SecurityProtocolType]::Tls12
+
+
+            Invoke-WebRequest `
+                -Uri $DownloadUrl `
+                -OutFile $Installer `
+                -UseBasicParsing
+
+        }
+        catch {
+
+            Write-Log `
+                "Error descargando AnyDesk: $($_.Exception.Message)" `
+                "ERROR"
+
+
+            Stop-AnyDeskDeploy -Code 20
+        }
+    }
+
+
+    if (-not (Test-Path -LiteralPath $Installer)) {
+
+        Write-Log `
+            "No se encontro el instalador descargado." `
+            "ERROR"
+
+
+        Stop-AnyDeskDeploy -Code 21
+    }
+
+
+    $DownloadedFile = Get-Item -LiteralPath $Installer
+
+
+    if ($DownloadedFile.Length -lt 1MB) {
+
+        Write-Log `
+            "El archivo descargado parece invalido. Tamano: $($DownloadedFile.Length) bytes." `
+            "ERROR"
+
+
+        Stop-AnyDeskDeploy -Code 22
+    }
+
+
+    if ($NeedsDownload) {
+
+        Write-Log `
+            ("Descarga completada. Tamano: {0:N2} MB" -f ($DownloadedFile.Length / 1MB)) `
+            "OK"
+    }
+
+
+    Write-Log `
+        "Validando firma digital del instalador..."
+
+
+    $Signature = Get-AuthenticodeSignature `
+        $Installer
+
+
+    if ($Signature.Status -ne "Valid") {
+
+        Write-Log `
+            "La firma digital del instalador no es valida. Estado: $($Signature.Status)" `
+            "ERROR"
+
+
+        Remove-Item `
+            -LiteralPath $Installer `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+
+        Stop-AnyDeskDeploy -Code 23
+    }
+
+
+    Write-Log `
+        "Firma digital valida: $($Signature.SignerCertificate.Subject)" `
+        "OK"
+}
+
+
+
+function Start-AnyDeskInstallerProcess {
+
+    param (
+        [string[]]$ArgumentList
+    )
+
+
+    $Quoted = foreach ($Argument in $ArgumentList) {
+
+        if ($Argument -match '\s|"') {
+
+            '"' + ($Argument -replace '"', '\"') + '"'
+
+        }
+        else {
+
+            $Argument
+        }
+    }
+
+
+    $ArgumentString = $Quoted -join " "
+
+
+    Write-Log `
+        "Comando de instalacion: $ArgumentString"
+
+
+    $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+
+    $StartInfo.FileName = $Installer
+
+    $StartInfo.Arguments = $ArgumentString
+
+    $StartInfo.UseShellExecute = $false
+
+    $StartInfo.CreateNoWindow = $true
+
+
+    $Process = New-Object System.Diagnostics.Process
+
+    $Process.StartInfo = $StartInfo
+
+
+    if (-not $Process.Start()) {
+
+        throw "No se pudo iniciar el instalador."
+    }
+
+
+    return $Process
 }
 
 
@@ -1405,7 +1744,7 @@ function Stop-InstalledAnyDeskGui {
     # El servicio y la instancia portable no se tocan.
     # Solo se cierra la ventana creada por la instalacion nueva.
 
-    if ($Script:InitialService) {
+    if ($Script:InitialService -and -not $Script:ReplacedInstall) {
 
         return
     }
@@ -1635,7 +1974,7 @@ function Hide-AnyDeskUserInterface {
     }
 
 
-    if (-not $Script:InitialService) {
+    if ((-not $Script:InitialService) -or $Script:ReplacedInstall) {
 
         $Ready = Restart-NewAnyDeskService
 
@@ -1921,8 +2260,8 @@ if ($Script:PortableExe) {
 if ($InitialService) {
 
     Write-Log `
-        "Servicio AnyDesk detectado." `
-        "OK"
+        "Servicio AnyDesk detectado. Sera reemplazado." `
+        "WARN"
 
 
     Write-Log `
@@ -1970,119 +2309,49 @@ else {
 
 
 # ============================================================
-# INSTALAR SI NO EXISTE SERVICIO
+# DESCARGAR E INSTALAR O REEMPLAZAR
 # ============================================================
 
-if (-not $InitialService) {
+$Script:ReplacedInstall = $false
 
-    # ========================================================
-    # DESCARGA
-    # ========================================================
-
-    Write-Log `
-        "Descargando AnyDesk desde el sitio oficial..."
+$Script:RemoveFirst = $false
 
 
-    try {
+if ($InitialService -or $Script:InstalledExe) {
 
-        [Net.ServicePointManager]::SecurityProtocol = `
-            [Net.SecurityProtocolType]::Tls12
+    $Script:ReplacedInstall = $true
+
+    $Script:RemoveFirst = [bool]$Script:InstalledExe
 
 
-        Invoke-WebRequest `
-            -Uri $DownloadUrl `
-            -OutFile $Installer `
-            -UseBasicParsing
-
-    }
-    catch {
+    if (-not $Script:InstalledExe) {
 
         Write-Log `
-            "Error descargando AnyDesk: $($_.Exception.Message)" `
-            "ERROR"
+            "Hay un servicio AnyDesk sin ejecutable en la carpeta de instalacion." `
+            "WARN"
 
 
-        Stop-AnyDeskDeploy -Code 20
+        Remove-AnyDeskServiceRecord
+
     }
-
-
-
-    if (-not (Test-Path -LiteralPath $Installer)) {
+    else {
 
         Write-Log `
-            "No se encontro el instalador descargado." `
-            "ERROR"
-
-
-        Stop-AnyDeskDeploy -Code 21
+            "Se reemplazara la instalacion de $($Script:InstalledExe)." `
+            "WARN"
     }
+}
 
 
-
-    $DownloadedFile = Get-Item -LiteralPath $Installer
-
-
-    if ($DownloadedFile.Length -lt 1MB) {
-
-        Write-Log `
-            "El archivo descargado parece invalido. Tamano: $($DownloadedFile.Length) bytes." `
-            "ERROR"
+Receive-AnyDeskInstaller
 
 
-        Stop-AnyDeskDeploy -Code 22
-    }
+# ========================================================
+# INSTALACION
+# ========================================================
 
-
-
-    Write-Log `
-        ("Descarga completada. Tamano: {0:N2} MB" -f `
-        ($DownloadedFile.Length / 1MB)) `
-        "OK"
-
-
-
-    # ========================================================
-    # FIRMA DIGITAL
-    # ========================================================
-
-    Write-Log `
-        "Validando firma digital del instalador..."
-
-
-    $Signature = Get-AuthenticodeSignature `
-        $Installer
-
-
-    if ($Signature.Status -ne "Valid") {
-
-        Write-Log `
-            "La firma digital del instalador no es valida. Estado: $($Signature.Status)" `
-            "ERROR"
-
-
-        Remove-Item `
-            -LiteralPath $Installer `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-
-        Stop-AnyDeskDeploy -Code 23
-    }
-
-
-
-    Write-Log `
-        "Firma digital valida: $($Signature.SignerCertificate.Subject)" `
-        "OK"
-
-
-
-    # ========================================================
-    # INSTALACION
-    # ========================================================
-
-    Write-Log `
-        "Iniciando instalacion persistente de AnyDesk..."
+Write-Log `
+    "Iniciando instalacion persistente de AnyDesk..."
 
 
     if ($Script:PortableExe) {
@@ -2093,13 +2362,21 @@ if (-not $InitialService) {
     }
 
 
-    # PowerShell 5.1 cita solo cada elemento del array. La ruta con
-    # espacios no debe llevar comillas adicionales.
+    # La ruta va entre comillas en ProcessStartInfo. Start-Process de
+    # Windows PowerShell 5.1 parte "C:\Program Files (x86)\AnyDesk".
     $InstallArguments = @(
         "--install",
-        $InstallDir,
-        "--silent"
+        $InstallDir
     )
+
+
+    if ($Script:RemoveFirst) {
+
+        $InstallArguments += "--remove-first"
+    }
+
+
+    $InstallArguments += "--silent"
 
 
     if ($ShowUserInterface) {
@@ -2125,10 +2402,8 @@ if (-not $InitialService) {
 
     try {
 
-        $InstallProcess = Start-Process `
-            -FilePath $Installer `
-            -ArgumentList $InstallArguments `
-            -PassThru
+        $InstallProcess = Start-AnyDeskInstallerProcess `
+            -ArgumentList $InstallArguments
 
 
         Write-Log `
@@ -2192,12 +2467,27 @@ if (-not $InitialService) {
 
 
 
+    if ($Script:ReplacedInstall) {
+
+        Write-Log `
+            "Servicio AnyDesk reemplazado." `
+            "OK"
+
+    }
+    else {
+
+        Write-Log `
+            "Servicio AnyDesk creado correctamente." `
+            "OK"
+    }
+
+
     Write-Log `
-        "Servicio AnyDesk creado correctamente." `
-        "OK"
+        "Esperando el ejecutable en $InstallDir..."
 
 
-    $Script:InstalledExe = Find-InstalledAnyDesk
+    $Script:InstalledExe = Wait-InstalledAnyDeskFile `
+        -TimeoutSeconds 60
 
 
     if (-not $Script:InstalledExe) {
@@ -2215,8 +2505,6 @@ if (-not $InitialService) {
     Write-Log `
         "AnyDesk instalado en: $Script:InstalledExe" `
         "OK"
-
-}
 
 
 
@@ -2353,17 +2641,24 @@ if ($Service.Status -ne "Running") {
 }
 else {
 
-    if ($Script:InitialService -or $ShowUserInterface) {
+    if ($ShowUserInterface) {
 
         Write-Log `
-            "Servicio ya se encuentra Running. NO se reiniciara." `
+            "Servicio ya se encuentra Running." `
+            "OK"
+
+    }
+    elseif ((-not $Script:InitialService) -or $Script:ReplacedInstall) {
+
+        Write-Log `
+            "Servicio en ejecucion. Se reiniciara una vez al aplicar la interfaz oculta." `
             "OK"
 
     }
     else {
 
         Write-Log `
-            "Servicio en ejecucion. Se reiniciara una vez al aplicar la interfaz oculta." `
+            "Servicio ya se encuentra Running." `
             "OK"
     }
 }
