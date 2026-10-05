@@ -5,6 +5,8 @@
 .DESCRIPTION
     - Requiere PowerShell ejecutado como Administrador.
     - Instala la ultima version de Notepad++, 7-Zip, Firefox y Chrome.
+      7-Zip no firma su instalador: se comprueba el SHA-256 de la
+      release oficial.
     - Deshabilita el Firewall de Windows en todas las redes y lo deja
       aplicado por directiva.
     - Habilita Escritorio remoto y desmarca "Permitir solo conexiones
@@ -219,25 +221,49 @@ function Save-WebFile {
 
 
 
-function Test-SignedInstaller {
+function Test-InstallerTrust {
 
     param (
 
         [Parameter(Mandatory = $true)]
-        [string]$Path
+        [string]$Path,
+
+        [string]$Sha256
     )
 
 
     $Signature = Get-AuthenticodeSignature -FilePath $Path
 
 
-    if ($Signature.Status -ne "Valid") {
+    if ($Signature.Status -eq "Valid") {
 
-        throw "Firma digital no valida. Estado: $($Signature.Status)"
+        return [string]$Signature.SignerCertificate.Subject
     }
 
 
-    return [string]$Signature.SignerCertificate.Subject
+    $Expected = ""
+
+    if (-not [string]::IsNullOrWhiteSpace($Sha256)) {
+
+        $Expected = $Sha256.Trim().ToLowerInvariant()
+    }
+
+
+    if ($Expected -match '^[0-9a-f]{64}$') {
+
+        $Actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+
+        if ($Actual.ToLowerInvariant() -eq $Expected) {
+
+            return "instalador oficial sin firma Authenticode, SHA-256 verificado"
+        }
+
+
+        throw "El SHA-256 no coincide con el publicado por el fabricante."
+    }
+
+
+    throw "Firma digital no valida. Estado: $($Signature.Status)"
 }
 
 
@@ -311,7 +337,9 @@ function Install-SetupPackage {
         [string]$FileName,
 
         [ValidateSet("NSIS", "MSI")]
-        [string]$Kind
+        [string]$Kind,
+
+        [string]$Sha256
     )
 
 
@@ -344,9 +372,12 @@ function Install-SetupPackage {
     Write-Log ("Descarga de {0} completada. Tamano: {1:N1} MB" -f $Name, ($Size / 1MB)) "OK"
 
 
-    $Signer = Test-SignedInstaller -Path $Destination
+    $Trust = Test-InstallerTrust -Path $Destination -Sha256 $Sha256
 
-    Write-Log "Firma valida de ${Name}: $Signer" "OK"
+    Write-Log "Integridad de ${Name}: $Trust" "OK"
+
+
+    Unblock-File -LiteralPath $Destination -ErrorAction SilentlyContinue
 
 
     if ($Kind -eq "MSI") {
@@ -442,36 +473,12 @@ function Get-NotepadPlusPlusUrl {
 
 
 
-function Get-SevenZipUrl {
+function Get-SevenZipPackage {
 
     param (
         [Parameter(Mandatory = $true)]
         [string]$Architecture
     )
-
-
-    $Page = Invoke-WebRequest `
-        -Uri "https://www.7-zip.org/download.html" `
-        -UseBasicParsing
-
-
-    $Pattern = switch ($Architecture) {
-
-        "ARM64" { 'https://github\.com/ip7z/7zip/releases/download/[^"\s]+/7z[0-9]+-arm64\.exe' }
-
-        "x64" { 'https://github\.com/ip7z/7zip/releases/download/[^"\s]+/7z[0-9]+-x64\.exe' }
-
-        default { 'https://github\.com/ip7z/7zip/releases/download/[^"\s]+/7z[0-9]+\.exe' }
-    }
-
-
-    $Match = [regex]::Match($Page.Content, $Pattern)
-
-
-    if ($Match.Success) {
-
-        return $Match.Value
-    }
 
 
     $Release = Invoke-RestMethod `
@@ -489,7 +496,8 @@ function Get-SevenZipUrl {
                 (
                     $Architecture -eq "x86" -and
                     $_.name -notlike "*-x64.exe" -and
-                    $_.name -notlike "*-arm64.exe"
+                    $_.name -notlike "*-arm64.exe" -and
+                    $_.name -notlike "*-arm.exe"
                 )
             )
         } |
@@ -502,7 +510,26 @@ function Get-SevenZipUrl {
     }
 
 
-    return $Asset.browser_download_url
+    $Url = [string]$Asset.browser_download_url
+
+    if ($Url -notlike "https://github.com/ip7z/7zip/releases/download/*/*.exe") {
+
+        throw "La URL del instalador de 7-Zip no es la oficial."
+    }
+
+
+    $Digest = ([string]$Asset.digest).Trim().ToLowerInvariant()
+
+    if ($Digest -notmatch '^sha256:([0-9a-f]{64})$') {
+
+        throw "7-Zip no publico el SHA-256 del instalador."
+    }
+
+
+    return [pscustomobject]@{
+        Url    = $Url
+        Sha256 = $Matches[1]
+    }
 }
 
 
@@ -612,6 +639,8 @@ function Install-BasicApplications {
 
             $Url = $null
 
+            $Sha256 = ""
+
 
             switch ($Package.Name) {
 
@@ -622,7 +651,11 @@ function Install-BasicApplications {
 
                 "7-Zip" {
 
-                    $Url = Get-SevenZipUrl -Architecture $Architecture
+                    $SevenZip = Get-SevenZipPackage -Architecture $Architecture
+
+                    $Url = $SevenZip.Url
+
+                    $Sha256 = $SevenZip.Sha256
                 }
 
                 "Firefox" {
@@ -641,7 +674,8 @@ function Install-BasicApplications {
                 -Name $Package.Name `
                 -Uri $Url `
                 -FileName $Package.File `
-                -Kind $Package.Kind
+                -Kind $Package.Kind `
+                -Sha256 $Sha256
 
         }
         catch {
