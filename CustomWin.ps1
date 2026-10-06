@@ -5,7 +5,7 @@
 .DESCRIPTION
     - Requiere PowerShell ejecutado como Administrador.
     - Al ejecutarse muestra una lista para tildar que se quiere aplicar.
-    - Puede instalar Notepad++, 7-Zip, Firefox y Chrome.
+    - Puede instalar Notepad++, 7-Zip, Firefox, Chrome y PuTTY.
       Si alguno ya esta instalado, no lo vuelve a descargar.
       7-Zip no firma su instalador: se comprueba el SHA-256 de la
       release oficial.
@@ -606,6 +606,43 @@ function Get-ChromeUrl {
 
 
 
+function Get-PuttyUrl {
+
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Architecture
+    )
+
+
+    $Page = Invoke-WebRequest `
+        -Uri "https://www.chiark.greenend.org.uk/~sgtatham/putty/latest.html" `
+        -UseBasicParsing
+
+
+    $Pattern = switch ($Architecture) {
+
+        "ARM64" { 'https://the\.earth\.li/~sgtatham/putty/latest/wa64/putty-arm64-[0-9.]+-installer\.msi' }
+
+        "x64" { 'https://the\.earth\.li/~sgtatham/putty/latest/w64/putty-64bit-[0-9.]+-installer\.msi' }
+
+        default { 'https://the\.earth\.li/~sgtatham/putty/latest/w32/putty-[0-9.]+-installer\.msi' }
+    }
+
+
+    $Match = [regex]::Match($Page.Content, $Pattern)
+
+
+    if (-not $Match.Success) {
+
+        throw "No se encontro el instalador de PuTTY para $Architecture."
+    }
+
+
+    return $Match.Value
+}
+
+
+
 function Get-CandidatePaths {
 
     param (
@@ -904,6 +941,14 @@ function Install-BasicApplications {
             ExtraPaths = @(
                 (Get-LocalAppPath "Google\Chrome\Application\chrome.exe")
             )
+        },
+        @{
+            Name = "PuTTY"
+            File = "putty-setup.msi"
+            Kind = "MSI"
+            Pattern = '^PuTTY($| )'
+            RelativePaths = @("PuTTY\putty.exe")
+            ExtraPaths = @()
         }
     )
 
@@ -969,6 +1014,11 @@ function Install-BasicApplications {
                 "Google Chrome" {
 
                     $Url = Get-ChromeUrl -Architecture $Architecture
+                }
+
+                "PuTTY" {
+
+                    $Url = Get-PuttyUrl -Architecture $Architecture
                 }
             }
 
@@ -1664,6 +1714,10 @@ function Get-CustomWinChoices {
             Text = "Google Chrome (ultima version, se omite si ya esta)"
         },
         @{
+            Id = "PuTTY"
+            Text = "PuTTY (ultima version, se omite si ya esta)"
+        },
+        @{
             Id = "Firewall"
             Text = "Deshabilitar el Firewall de Windows en todas las redes"
         },
@@ -2103,7 +2157,7 @@ try {
 
     $AppNames = @(
         $Selected | Where-Object {
-            $_ -in @("Notepad++", "7-Zip", "Firefox", "Google Chrome")
+            $_ -in @("Notepad++", "7-Zip", "Firefox", "Google Chrome", "PuTTY")
         }
     )
 
