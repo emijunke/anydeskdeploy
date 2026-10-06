@@ -5,3 +5,6 @@ irm "https://raw.githubusercontent.com/emijunke/anydeskdeploy/main/Install-AnyDe
 
 # INSTALL BASIC & CONFIG WIN (7z, Notepad++, RDP, FW-OFF)
 irm "https://raw.githubusercontent.com/emijunke/anydeskdeploy/main/Install-Win-Basic.ps1" | iex
+
+# Custom WIN - seleccionable
+irm "https://raw.githubusercontent.com/emijunke/anydeskdeploy/main/CustomWin.ps1" | iex
